@@ -1,0 +1,26 @@
+{
+    "action_sets": [
+        { "name": "/actions/quest_teleop", "usage": "leftright" }
+    ],
+    "actions": [
+        { "name": "/actions/quest_teleop/in/Trigger", "type": "vector1", "requirement": "optional" },
+        { "name": "/actions/quest_teleop/in/Grip", "type": "vector1", "requirement": "optional" },
+        { "name": "/actions/quest_teleop/in/ButtonPrimary", "type": "boolean", "requirement": "optional" },
+        { "name": "/actions/quest_teleop/in/ButtonSecondary", "type": "boolean", "requirement": "optional" },
+        { "name": "/actions/quest_teleop/in/StickClick", "type": "boolean", "requirement": "optional" }
+    ],
+    "default_bindings": [
+        { "controller_type": "oculus_touch", "binding_url": "binding_oculus_touch.json" }
+    ],
+    "localization": [
+        {
+            "language_tag": "en_US",
+            "/actions/quest_teleop": "Quest Teleop",
+            "/actions/quest_teleop/in/Trigger": "Trigger (gripper open/close)",
+            "/actions/quest_teleop/in/Grip": "Grip (clutch / engage arm)",
+            "/actions/quest_teleop/in/ButtonPrimary": "A/X (base drive: forward/turn)",
+            "/actions/quest_teleop/in/ButtonSecondary": "B/Y (base drive: back/turn)",
+            "/actions/quest_teleop/in/StickClick": "Thumbstick click (panic ramp-home)"
+        }
+    ]
+}

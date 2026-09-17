@@ -1,0 +1,652 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Quest Teleop</title>
+<style>
+  body { margin: 0; background: #14141c; color: #eee; font: 14px/1.4 monospace; }
+  #ui { padding: 16px; }
+  button { font-size: 20px; padding: 10px 20px; }
+  #status { white-space: pre; margin-top: 12px; }
+  .ok { color: #6f6; }
+  .bad { color: #f66; }
+</style>
+</head>
+<body>
+<div id="ui">
+  <button id="enter-vr">Enter VR</button>
+  <div id="status">connecting to relay...</div>
+</div>
+<canvas id="gl" style="display:none"></canvas>
+<script>
+"use strict";
+
+// ===========================================================================
+// This page has two independent jobs:
+//
+//  1. Capture head/left/right pose + button state and relay it, raw and
+//     unmodified, to webxr_server.py -> quest_server.py. This is the real
+//     data path; see poseToWire()/gamepadButtons() and the ws.send() call.
+//
+//  2. An IN-VR debug HUD (cubes at each tracked device + a floating text
+//     panel) that locally REPLICATES quest_server.py's engage/gripper/base
+//     math (see the "DEBUG-ONLY REPLICA" section) purely so you can verify
+//     the intended behavior with your own eyes before ever touching the
+//     robot. quest_server.py is the only authoritative implementation --
+//     if you change the clutch/gripper/base logic there, update the copy
+//     here too or this HUD will show something the robot doesn't actually
+//     do.
+// ===========================================================================
+
+// ---- config -------------------------------------------------------------
+const WS_URL = `wss://${location.host}/ws`;
+const SEND_HZ = 50;
+
+const BTN_TRIGGER = 0;
+const BTN_GRIP = 1;
+const BTN_THUMBSTICK = 3;
+const BTN_PRIMARY = 4;   // X (left controller) / A (right controller)
+const BTN_SECONDARY = 5; // Y (left controller) / B (right controller)
+
+// Mirrors quest_server.py's get_args() defaults -- keep in sync by hand.
+const GRIPPER_MIN = 0.0;
+const GRIPPER_MAX = 0.1;
+const BASE_LINEAR_SPEED = 0.15;   // m/s
+const BASE_ANGULAR_SPEED = 0.3;   // rad/s
+
+// ---- websocket relay (to webxr_server.py, which forwards to quest_server.py) --
+let ws = null;
+let wsOpen = false;
+
+function connectWs() {
+  ws = new WebSocket(WS_URL);
+  ws.onopen = () => { wsOpen = true; setStatusLine("ws", "OPEN", true); };
+  ws.onclose = () => { wsOpen = false; setStatusLine("ws", "CLOSED (retrying)", false); setTimeout(connectWs, 1000); };
+  ws.onerror = () => { try { ws.close(); } catch (e) {} };
+  // Incoming messages are either camera frames (CameraBridge) or status
+  // frames quest_server.py writes back on the pose connection itself, e.g.
+  // per-arm IK failure (RobotBridge) -- see webxr_server.py. Referenced
+  // names (updateCamTexture, CAM_NAMES, ikStatus) are defined later in this
+  // file but that's fine -- this callback only runs once real messages
+  // arrive, well after the whole script has finished evaluating.
+  ws.onmessage = (ev) => {
+    let msg;
+    try { msg = JSON.parse(ev.data); } catch (e) { return; }
+    if (msg.type === "camera") {
+      const got = CAM_NAMES.filter((n) => msg[n]);
+      for (const name of got) updateCamTexture(name, msg[name]);
+      if (got.length) setStatusLine("cam", got.join(",") + " @ " + new Date().toLocaleTimeString(), true);
+    } else if (msg.type === "ik_status") {
+      ikStatus = msg;
+    }
+  };
+}
+connectWs();
+
+const statusLines = {};
+function setStatusLine(key, text, ok) {
+  statusLines[key] = { text, ok };
+  renderStatus();
+}
+function renderStatus() {
+  const el = document.getElementById("status");
+  const order = ["ws", "xr", "head", "left", "right", "cam"];
+  el.innerHTML = order
+    .filter((k) => statusLines[k])
+    .map((k) => {
+      const { text, ok } = statusLines[k];
+      const cls = ok === true ? "ok" : ok === false ? "bad" : "";
+      return `<span class="${cls}">${k}: ${text}</span>`;
+    })
+    .join("\n");
+}
+
+// ---- pose helpers ---------------------------------------------------------
+// XRRigidTransform.matrix is column-major, right-handed, +Y up. For a
+// 'local-floor'/'local' reference space uses a right-handed, +Y-up frame.
+// section 9's convention (+Y up, -Z forward at session start) --
+// R_QUEST_TO_PIPER in quest_server.py applies unchanged to poses from here.
+function rot3x3(m) {
+  // column-major 4x4 -> row-major 3x3 (protocol.py's 'rot' convention).
+  return [
+    [m[0], m[4], m[8]],
+    [m[1], m[5], m[9]],
+    [m[2], m[6], m[10]],
+  ];
+}
+function poseToWire(rigidTransform) {
+  const m = rigidTransform.matrix;
+  const r = rot3x3(m);
+  return { pos: [m[12], m[13], m[14]], rot: [...r[0], ...r[1], ...r[2]] };
+}
+function gamepadButtons(gamepad) {
+  if (!gamepad) return null;
+  const b = gamepad.buttons;
+  const get = (i) => (b && b[i]) ? b[i] : { value: 0, pressed: false };
+  const trig = get(BTN_TRIGGER), grip = get(BTN_GRIP);
+  const primary = get(BTN_PRIMARY), secondary = get(BTN_SECONDARY), stick = get(BTN_THUMBSTICK);
+  return {
+    trigger: trig.value, grip: grip.value,
+    grip_pressed: !!grip.pressed, trigger_pressed: !!trig.pressed,
+    button_ax: !!primary.pressed, button_by: !!secondary.pressed,
+    stick_pressed: !!stick.pressed,
+  };
+}
+
+// ---- tiny column-major mat4 helpers (WebGL/WebXR native convention) -------
+function mat4Multiply(a, b) {
+  const out = new Float32Array(16);
+  for (let col = 0; col < 4; col++) {
+    for (let row = 0; row < 4; row++) {
+      let sum = 0;
+      for (let k = 0; k < 4; k++) sum += a[k * 4 + row] * b[col * 4 + k];
+      out[col * 4 + row] = sum;
+    }
+  }
+  return out;
+}
+function mat4Scale(sx, sy, sz) {
+  return new Float32Array([sx, 0, 0, 0, 0, sy, 0, 0, 0, 0, sz, 0, 0, 0, 0, 1]);
+}
+function mat4Translate(x, y, z) {
+  return new Float32Array([1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, x, y, z, 1]);
+}
+
+// ---- DEBUG-ONLY REPLICA of quest_server.py's clutch/gripper/base math -----
+// For the in-VR HUD only. Never sent over the wire; quest_server.py always
+// computes its own copy of this independently and does not trust the client.
+const replica = {
+  engaged: false,
+  prevBothGrip: false,
+  lockHead: null, lockLeft: null, lockRight: null, // snapshotted column-major matrices
+  baseTurnedDeg: 0.0,
+  baseMovedM: 0.0,
+  lastT: null,
+};
+
+// Per-arm IK failure text from quest_server.py (see ws.onmessage's
+// "ik_status" handling). IK failure intentionally leaves the arm exactly
+// where it is with no local signal otherwise -- this is what makes "my
+// hand kept moving but the arm stopped" visible instead of silent.
+let ikStatus = { mid: "", left: "", right: "" };
+
+// Numerically identical to R_QUEST_TO_PIPER in quest_server.py: Quest world
+// (right/up/back) -> Piper world (forward/left/up). Applying this to the
+// HUD's position delta means the numbers you read ARE "how far forward /
+// left / up the arm would move", not raw Quest-frame numbers you'd have to
+// mentally cross-reference against the Readme.
+function questDeltaToPiperFwdLeftUp(v) {
+  return [-v[2], -v[0], v[1]]; // fwd=-quest_z, left=-quest_x, up=quest_y
+}
+
+function deltaPosDeg(curM, lockM) {
+  const dposQuest = [curM[12] - lockM[12], curM[13] - lockM[13], curM[14] - lockM[14]];
+  const dposFwdLeftUp = questDeltaToPiperFwdLeftUp(dposQuest);
+  const Rc = rot3x3(curM), Rl = rot3x3(lockM);
+  // delta_R = Rc * Rl^T (matches quest_server.py's ArmChannel.track_step).
+  // Rotation ANGLE magnitude is frame-invariant under the Quest->Piper
+  // similarity transform (conjugating both Rc and Rl by the same orthogonal
+  // matrix preserves trace), so no remap is needed for `deg` specifically.
+  let trace = 0;
+  for (let i = 0; i < 3; i++) {
+    for (let j = 0; j < 3; j++) {
+      let sum = 0;
+      for (let k = 0; k < 3; k++) sum += Rc[i][k] * Rl[j][k]; // Rl^T[k][j] = Rl[j][k]
+      if (i === j) trace += sum;
+    }
+  }
+  const deg = Math.acos(Math.max(-1, Math.min(1, (trace - 1) / 2))) * 180 / Math.PI;
+  return { dposFwdLeftUp, deg };
+}
+
+function updateReplica(t, head, left, right, headM, leftM, rightM) {
+  const now = t / 1000.0;
+  const dt = replica.lastT === null ? 0 : Math.max(0, now - replica.lastT);
+  replica.lastT = now;
+
+  const lBtn = left.buttons, rBtn = right.buttons;
+  const panic = !!(lBtn && lBtn.stick_pressed) || !!(rBtn && rBtn.stick_pressed);
+  const bothGrip = !!(lBtn && lBtn.grip_pressed && rBtn && rBtn.grip_pressed);
+  const allPresent = head.connected && left.connected && right.connected;
+
+  if (panic) {
+    replica.engaged = false;
+    replica.baseTurnedDeg = 0;
+    replica.baseMovedM = 0;
+  } else if (bothGrip && !replica.prevBothGrip && allPresent) {
+    // Toggle on the rising edge of "both grips pressed together": press once
+    // to engage (lock all 3 origins), press together again to disengage.
+    // NOT a hold-to-track gesture -- letting go of one/both grips after
+    // engaging does nothing by itself.
+    if (replica.engaged) {
+      replica.engaged = false;
+    } else {
+      replica.lockHead = headM.slice();
+      replica.lockLeft = leftM.slice();
+      replica.lockRight = rightM.slice();
+      replica.engaged = true;
+    }
+  }
+  replica.prevBothGrip = bothGrip && !panic;
+
+  // Left X/Y = turn left/right, right A/B = backward/forward.
+  if (!panic) {
+    if (lBtn && lBtn.button_ax) replica.baseTurnedDeg += BASE_ANGULAR_SPEED * dt * 180 / Math.PI;  // X: turn left
+    if (lBtn && lBtn.button_by) replica.baseTurnedDeg -= BASE_ANGULAR_SPEED * dt * 180 / Math.PI;  // Y: turn right
+    if (rBtn && rBtn.button_by) replica.baseMovedM += BASE_LINEAR_SPEED * dt;   // B: forward
+    if (rBtn && rBtn.button_ax) replica.baseMovedM -= BASE_LINEAR_SPEED * dt;   // A: backward
+  }
+
+  return { panic, bothGrip };
+}
+
+function gripperOpenM(trigger) {
+  // Released (0, resting) = open, squeezed (1) = closed -- matches
+  // quest_server.py's ArmChannel.track_step().
+  return GRIPPER_MAX - trigger * (GRIPPER_MAX - GRIPPER_MIN);
+}
+
+// ---- WebGL: shaders, geometry -----------------------------------------------
+const canvas = document.getElementById("gl");
+const gl = canvas.getContext("webgl", { xrCompatible: true });
+
+function compileShader(type, src) {
+  const s = gl.createShader(type);
+  gl.shaderSource(s, src);
+  gl.compileShader(s);
+  if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) {
+    throw new Error("shader compile failed: " + gl.getShaderInfoLog(s));
+  }
+  return s;
+}
+function makeProgram(vsSrc, fsSrc) {
+  const p = gl.createProgram();
+  gl.attachShader(p, compileShader(gl.VERTEX_SHADER, vsSrc));
+  gl.attachShader(p, compileShader(gl.FRAGMENT_SHADER, fsSrc));
+  gl.linkProgram(p);
+  if (!gl.getProgramParameter(p, gl.LINK_STATUS)) {
+    throw new Error("program link failed: " + gl.getProgramInfoLog(p));
+  }
+  return p;
+}
+
+const flatProgram = makeProgram(
+  `attribute vec3 aPos; uniform mat4 uMVP;
+   void main() { gl_Position = uMVP * vec4(aPos, 1.0); }`,
+  `precision mediump float; uniform vec4 uColor;
+   void main() { gl_FragColor = uColor; }`
+);
+const flatLoc = {
+  aPos: gl.getAttribLocation(flatProgram, "aPos"),
+  uMVP: gl.getUniformLocation(flatProgram, "uMVP"),
+  uColor: gl.getUniformLocation(flatProgram, "uColor"),
+};
+
+const texProgram = makeProgram(
+  `attribute vec3 aPos; attribute vec2 aUV; uniform mat4 uMVP; varying vec2 vUV;
+   void main() { gl_Position = uMVP * vec4(aPos, 1.0); vUV = aUV; }`,
+  `precision mediump float; uniform sampler2D uTex; varying vec2 vUV;
+   void main() { gl_FragColor = texture2D(uTex, vUV); }`
+);
+const texLoc = {
+  aPos: gl.getAttribLocation(texProgram, "aPos"),
+  aUV: gl.getAttribLocation(texProgram, "aUV"),
+  uMVP: gl.getUniformLocation(texProgram, "uMVP"),
+  uTex: gl.getUniformLocation(texProgram, "uTex"),
+};
+
+// Unit box (half-extent 1 on each axis), scaled per-draw via the model matrix.
+const boxVerts = new Float32Array([
+  -1, -1, -1,  1, -1, -1,  1, 1, -1,  -1, 1, -1,
+  -1, -1, 1,   1, -1, 1,   1, 1, 1,   -1, 1, 1,
+]);
+const boxVBO = gl.createBuffer();
+gl.bindBuffer(gl.ARRAY_BUFFER, boxVBO);
+gl.bufferData(gl.ARRAY_BUFFER, boxVerts, gl.STATIC_DRAW);
+
+const boxTriIdx = new Uint16Array([
+  0,1,2, 0,2,3,  4,6,5, 4,7,6,  0,4,5, 0,5,1,
+  1,5,6, 1,6,2,  2,6,7, 2,7,3,  3,7,4, 3,4,0,
+]);
+const boxTriIBO = gl.createBuffer();
+gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, boxTriIBO);
+gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, boxTriIdx, gl.STATIC_DRAW);
+
+const boxLineIdx = new Uint16Array([
+  0,1, 1,2, 2,3, 3,0,  4,5, 5,6, 6,7, 7,4,  0,4, 1,5, 2,6, 3,7,
+]);
+const boxLineIBO = gl.createBuffer();
+gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, boxLineIBO);
+gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, boxLineIdx, gl.STATIC_DRAW);
+
+function drawBox(vp, modelM, scaleXYZ, color, wireframe) {
+  const model = mat4Multiply(modelM, mat4Scale(scaleXYZ[0], scaleXYZ[1], scaleXYZ[2]));
+  const mvp = mat4Multiply(vp, model);
+  gl.useProgram(flatProgram);
+  gl.bindBuffer(gl.ARRAY_BUFFER, boxVBO);
+  gl.enableVertexAttribArray(flatLoc.aPos);
+  gl.vertexAttribPointer(flatLoc.aPos, 3, gl.FLOAT, false, 0, 0);
+  gl.uniformMatrix4fv(flatLoc.uMVP, false, mvp);
+  gl.uniform4fv(flatLoc.uColor, color);
+  if (wireframe) {
+    gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, boxLineIBO);
+    gl.drawElements(gl.LINES, boxLineIdx.length, gl.UNSIGNED_SHORT, 0);
+  } else {
+    gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, boxTriIBO);
+    gl.drawElements(gl.TRIANGLES, boxTriIdx.length, gl.UNSIGNED_SHORT, 0);
+  }
+}
+
+// HUD quad, centered, with UVs (canvas texture uploaded below). Sized/placed
+// (see drawHud's distance) for legibility -- bumped up after on-headset
+// testing showed the first pass too small to read the gripper numbers.
+const HUD_W = 0.90, HUD_H = 0.62;
+const quadVerts = new Float32Array([
+  -HUD_W/2, -HUD_H/2, 0,  0, 1,
+   HUD_W/2, -HUD_H/2, 0,  1, 1,
+   HUD_W/2,  HUD_H/2, 0,  1, 0,
+  -HUD_W/2,  HUD_H/2, 0,  0, 0,
+]);
+const quadVBO = gl.createBuffer();
+gl.bindBuffer(gl.ARRAY_BUFFER, quadVBO);
+gl.bufferData(gl.ARRAY_BUFFER, quadVerts, gl.STATIC_DRAW);
+const quadIdx = new Uint16Array([0, 1, 2, 0, 2, 3]);
+const quadIBO = gl.createBuffer();
+gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, quadIBO);
+gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, quadIdx, gl.STATIC_DRAW);
+
+const hudCanvas = document.createElement("canvas");
+hudCanvas.width = 1200; hudCanvas.height = 828;
+const hudCtx = hudCanvas.getContext("2d");
+const hudTex = gl.createTexture();
+gl.bindTexture(gl.TEXTURE_2D, hudTex);
+gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+
+function fmtFwdLeftUp(v) {
+  return `fwd${v[0]>=0?"+":""}${v[0].toFixed(2)} left${v[1]>=0?"+":""}${v[1].toFixed(2)} up${v[2]>=0?"+":""}${v[2].toFixed(2)}`;
+}
+
+function renderHudText(engaged, panic, head, left, right, headM, leftM, rightM) {
+  const c = hudCtx;
+  c.fillStyle = "rgba(10,10,16,0.9)";
+  c.fillRect(0, 0, hudCanvas.width, hudCanvas.height);
+
+  let y = 18;
+  const bigLine = (text, color, size) => {
+    c.font = `${size || 40}px monospace`;
+    c.textBaseline = "top";
+    c.fillStyle = color || "#eee";
+    c.fillText(text, 20, y);
+    y += (size || 40) + 16;
+  };
+
+  if (panic) {
+    bigLine("*** PANIC (thumbstick) ***", "#f66");
+    bigLine("ramp home + base stop", "#f66", 30);
+  } else {
+    bigLine(engaged ? "ENGAGED" : "idle", engaged ? "#6f6" : "#ccc");
+    bigLine(engaged ? "(both grips again = release)" : "(both grips together = engage)", "#999", 26);
+  }
+
+  // Deltas shown in Piper's frame (+fwd, +left, +up), not raw Quest axes --
+  // matches R_QUEST_TO_PIPER in quest_server.py, see questDeltaToPiperFwdLeftUp().
+  if (engaged && replica.lockHead) {
+    const h = deltaPosDeg(headM, replica.lockHead);
+    bigLine(`head  ${fmtFwdLeftUp(h.dposFwdLeftUp)}  rot${h.deg.toFixed(0)}deg`, "#fff", 30);
+  } else {
+    bigLine("head  (not engaged)", "#888", 30);
+  }
+  if (ikStatus.mid) bigLine(`  ! IK FAIL (mid stuck): ${ikStatus.mid}`, "#f66", 26);
+
+  if (engaged && replica.lockLeft && left.connected) {
+    const l = deltaPosDeg(leftM, replica.lockLeft);
+    const trig = left.buttons ? left.buttons.trigger : 0;
+    bigLine(`left  ${fmtFwdLeftUp(l.dposFwdLeftUp)}  rot${l.deg.toFixed(0)}deg`, "#9cf", 30);
+    bigLine(`  GRIP_OPEN = ${gripperOpenM(trig).toFixed(3)} m  (trigger ${trig.toFixed(2)})`, "#9cf", 34);
+  } else {
+    bigLine("left  (not engaged)", "#888", 30);
+  }
+  if (ikStatus.left) bigLine(`  ! IK FAIL (left stuck): ${ikStatus.left}`, "#f66", 26);
+
+  if (engaged && replica.lockRight && right.connected) {
+    const r = deltaPosDeg(rightM, replica.lockRight);
+    const trig = right.buttons ? right.buttons.trigger : 0;
+    bigLine(`right ${fmtFwdLeftUp(r.dposFwdLeftUp)}  rot${r.deg.toFixed(0)}deg`, "#fb8", 30);
+    bigLine(`  GRIP_OPEN = ${gripperOpenM(trig).toFixed(3)} m  (trigger ${trig.toFixed(2)})`, "#fb8", 34);
+  } else {
+    bigLine("right (not engaged)", "#888", 30);
+  }
+  if (ikStatus.right) bigLine(`  ! IK FAIL (right stuck): ${ikStatus.right}`, "#f66", 26);
+
+  bigLine(`base  turned ${replica.baseTurnedDeg>=0?"+":""}${replica.baseTurnedDeg.toFixed(0)}deg   moved ${replica.baseMovedM>=0?"+":""}${replica.baseMovedM.toFixed(2)}m`, "#dd8", 34);
+  bigLine("L: X=turn-left Y=turn-right   R: A=back B=fwd   stick=panic", "#888", 24);
+
+  gl.bindTexture(gl.TEXTURE_2D, hudTex);
+  // Verified empirically on-headset: default (no UNPACK_FLIP_Y_WEBGL) is the
+  // orientation that reads right-side-up with this quad's UV layout. Do not
+  // "fix" this again without re-testing on-headset -- the correct value here
+  // is not derivable by reasoning alone, both this and its opposite look
+  // plausible on paper.
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, hudCanvas);
+}
+
+function drawHud(vp, headM) {
+  // Follows the head: positioned in front and below eye line, clear of the
+  // camera panel row above it (see CAM_Y_OFFSET / drawCameraPanels).
+  const model = mat4Multiply(headM, mat4Translate(0, -0.25, -0.85));
+  const mvp = mat4Multiply(vp, model);
+  gl.useProgram(texProgram);
+  gl.bindBuffer(gl.ARRAY_BUFFER, quadVBO);
+  gl.enableVertexAttribArray(texLoc.aPos);
+  gl.vertexAttribPointer(texLoc.aPos, 3, gl.FLOAT, false, 5 * 4, 0);
+  gl.enableVertexAttribArray(texLoc.aUV);
+  gl.vertexAttribPointer(texLoc.aUV, 2, gl.FLOAT, false, 5 * 4, 3 * 4);
+  gl.uniformMatrix4fv(texLoc.uMVP, false, mvp);
+  gl.activeTexture(gl.TEXTURE0);
+  gl.bindTexture(gl.TEXTURE_2D, hudTex);
+  gl.uniform1i(texLoc.uTex, 0);
+  gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, quadIBO);
+  gl.drawElements(gl.TRIANGLES, quadIdx.length, gl.UNSIGNED_SHORT, 0);
+}
+
+// Generic unit quad (-0.5..+0.5 both axes), scaled per-draw via the model
+// matrix -- unlike the HUD's fixed-size quadVBO above, camera panels come in
+// 3 different world positions sharing one size, so a reusable unit quad is
+// less repetition than baking size into the geometry per-panel.
+const unitQuadVerts = new Float32Array([
+  -0.5, -0.5, 0,  0, 1,
+   0.5, -0.5, 0,  1, 1,
+   0.5,  0.5, 0,  1, 0,
+  -0.5,  0.5, 0,  0, 0,
+]);
+const unitQuadVBO = gl.createBuffer();
+gl.bindBuffer(gl.ARRAY_BUFFER, unitQuadVBO);
+gl.bufferData(gl.ARRAY_BUFFER, unitQuadVerts, gl.STATIC_DRAW);
+const unitQuadIBO = gl.createBuffer();
+gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, unitQuadIBO);
+gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, quadIdx, gl.STATIC_DRAW);  // same 0,1,2,0,2,3 winding as the HUD quad
+
+// ---- camera panels ----------------------------------------------------------
+// In-VR visual feedback (see camera_streamer.py + webxr_server.py's
+// CameraBridge). A row of 3 panels above the HUD: left/mid/right cameras,
+// left-to-right matching their physical position on the robot. Sizes/
+// distance are a first guess -- expect to retune after actually seeing them
+// on-headset, same as the HUD needed a size pass.
+const CAM_NAMES = ["left", "mid", "right"];
+const CAM_PANEL_W = 0.38, CAM_PANEL_H = 0.26, CAM_GAP = 0.04, CAM_DIST = 0.85, CAM_Y = 0.20;
+const CAM_X_OFFSET = { left: -(CAM_PANEL_W + CAM_GAP), mid: 0, right: (CAM_PANEL_W + CAM_GAP) };
+
+const camTex = {};
+for (const name of CAM_NAMES) {
+  const tex = gl.createTexture();
+  gl.bindTexture(gl.TEXTURE_2D, tex);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+  // 1x1 placeholder (dark gray) until the first real frame arrives.
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, 1, 1, 0, gl.RGBA, gl.UNSIGNED_BYTE, new Uint8Array([40, 40, 50, 255]));
+  camTex[name] = tex;
+}
+
+async function updateCamTexture(name, base64Jpeg) {
+  try {
+    const bin = atob(base64Jpeg);
+    const bytes = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+    const bitmap = await createImageBitmap(new Blob([bytes], { type: "image/jpeg" }));
+    gl.bindTexture(gl.TEXTURE_2D, camTex[name]);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, bitmap);
+    bitmap.close();
+  } catch (e) {
+    // Drop malformed/partial frames silently -- not worth spamming the
+    // console at the camera stream's send rate.
+  }
+}
+
+function drawCameraPanels(vp, headM) {
+  for (const name of CAM_NAMES) {
+    const local = mat4Multiply(
+      mat4Translate(CAM_X_OFFSET[name], CAM_Y, -CAM_DIST),
+      mat4Scale(CAM_PANEL_W, CAM_PANEL_H, 1),
+    );
+    const model = mat4Multiply(headM, local);
+    const mvp = mat4Multiply(vp, model);
+    gl.useProgram(texProgram);
+    gl.bindBuffer(gl.ARRAY_BUFFER, unitQuadVBO);
+    gl.enableVertexAttribArray(texLoc.aPos);
+    gl.vertexAttribPointer(texLoc.aPos, 3, gl.FLOAT, false, 5 * 4, 0);
+    gl.enableVertexAttribArray(texLoc.aUV);
+    gl.vertexAttribPointer(texLoc.aUV, 2, gl.FLOAT, false, 5 * 4, 3 * 4);
+    gl.uniformMatrix4fv(texLoc.uMVP, false, mvp);
+    gl.activeTexture(gl.TEXTURE0);
+    gl.bindTexture(gl.TEXTURE_2D, camTex[name]);
+    gl.uniform1i(texLoc.uTex, 0);
+    gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, unitQuadIBO);
+    gl.drawElements(gl.TRIANGLES, 6, gl.UNSIGNED_SHORT, 0);
+  }
+}
+
+// ---- WebXR session ---------------------------------------------------------
+async function enterVR() {
+  if (!navigator.xr) {
+    setStatusLine("xr", "navigator.xr unavailable (not WebXR-capable browser)", false);
+    return;
+  }
+  const supported = await navigator.xr.isSessionSupported("immersive-vr");
+  if (!supported) {
+    setStatusLine("xr", "immersive-vr not supported", false);
+    return;
+  }
+  const session = await navigator.xr.requestSession("immersive-vr", {
+    optionalFeatures: ["local-floor"],
+  });
+  await gl.makeXRCompatible();
+  session.updateRenderState({ baseLayer: new XRWebGLLayer(session, gl) });
+
+  let refSpace;
+  try {
+    refSpace = await session.requestReferenceSpace("local-floor");
+  } catch (e) {
+    refSpace = await session.requestReferenceSpace("local");
+  }
+
+  setStatusLine("xr", "session active", true);
+  session.addEventListener("end", () => setStatusLine("xr", "session ended", false));
+
+  gl.enable(gl.DEPTH_TEST);
+  gl.disable(gl.CULL_FACE);
+
+  let seq = 0;
+  let lastSend = 0;
+  let lastHudRender = 0;
+  const sendPeriodMs = 1000 / SEND_HZ;
+  const hudPeriodMs = 100; // text HUD refresh -- numbers don't need 90Hz
+
+  session.requestAnimationFrame(function onFrame(t, frame) {
+    session.requestAnimationFrame(onFrame);
+
+    const layer = session.renderState.baseLayer;
+    const pose = frame.getViewerPose(refSpace);
+
+    gl.bindFramebuffer(gl.FRAMEBUFFER, layer.framebuffer);
+    gl.clearColor(0.05, 0.05, 0.08, 1.0);
+    gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+
+    // ---- gather this frame's pose/button state (same for both eyes) ----
+    let head = { connected: false }, headM = null;
+    if (pose) {
+      headM = pose.transform.matrix;
+      head = { connected: true, valid: true, tracking_ok: true, ...poseToWire(pose.transform) };
+      setStatusLine("head", "tracked", true);
+    } else {
+      setStatusLine("head", "no pose", false);
+    }
+
+    let left = { connected: false }, leftM = null;
+    let right = { connected: false }, rightM = null;
+    for (const src of frame.session.inputSources) {
+      if (!src.gripSpace || (src.handedness !== "left" && src.handedness !== "right")) continue;
+      const gripPose = frame.getPose(src.gripSpace, refSpace);
+      const btns = gamepadButtons(src.gamepad);
+      if (src.handedness === "left") {
+        if (gripPose) { leftM = gripPose.transform.matrix; left = { connected: true, valid: true, tracking_ok: true, ...poseToWire(gripPose.transform), buttons: btns }; }
+        setStatusLine("left", gripPose ? "tracked" : "no pose", !!gripPose);
+      } else {
+        if (gripPose) { rightM = gripPose.transform.matrix; right = { connected: true, valid: true, tracking_ok: true, ...poseToWire(gripPose.transform), buttons: btns }; }
+        setStatusLine("right", gripPose ? "tracked" : "no pose", !!gripPose);
+      }
+    }
+
+    // ---- relay to the robot (unchanged real data path) ----
+    if (t - lastSend >= sendPeriodMs) {
+      lastSend = t;
+      if (wsOpen) {
+        const msg = { v: 1, seq: seq++, t_mono: t / 1000.0, t_wall: Date.now() / 1000.0, head, left, right };
+        try { ws.send(JSON.stringify(msg)); } catch (e) {}
+      }
+    }
+
+    // ---- debug HUD replica + render ----
+    let panicNow = false, engagedNow = replica.engaged;
+    if (head.connected && left.connected && right.connected) {
+      const r = updateReplica(t, head, left, right, headM, leftM, rightM);
+      panicNow = r.panic;
+      engagedNow = replica.engaged;
+    }
+    if (t - lastHudRender >= hudPeriodMs) {
+      lastHudRender = t;
+      renderHudText(engagedNow, panicNow, head, left, right, headM, leftM, rightM);
+    }
+
+    if (!pose) return; // nothing to render relative to if we don't know where the head is
+
+    for (const view of pose.views) {
+      const vp3 = layer.getViewport(view);
+      gl.viewport(vp3.x, vp3.y, vp3.width, vp3.height);
+      const VP = mat4Multiply(view.projectionMatrix, view.transform.inverse.matrix);
+
+      if (headM) drawBox(VP, headM, [0.02, 0.02, 0.05], [1, 1, 1, 1], false);
+      if (leftM) drawBox(VP, leftM, [0.02, 0.02, 0.05], [0.3, 0.6, 1.0, 1], false);
+      if (rightM) drawBox(VP, rightM, [0.02, 0.02, 0.05], [1.0, 0.45, 0.3, 1], false);
+
+      if (engagedNow) {
+        if (replica.lockHead) drawBox(VP, replica.lockHead, [0.04, 0.04, 0.04], [0.6, 0.6, 0.6, 1], true);
+        if (replica.lockLeft) drawBox(VP, replica.lockLeft, [0.04, 0.04, 0.04], [0.5, 0.7, 1.0, 1], true);
+        if (replica.lockRight) drawBox(VP, replica.lockRight, [0.04, 0.04, 0.04], [1.0, 0.6, 0.5, 1], true);
+      }
+
+      drawCameraPanels(VP, headM);
+      drawHud(VP, headM);
+    }
+  });
+}
+
+document.getElementById("enter-vr").addEventListener("click", () => {
+  enterVR().catch((e) => setStatusLine("xr", "enterVR failed: " + e.message, false));
+});
+</script>
+</body>
+</html>
