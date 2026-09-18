@@ -1,3 +1,6 @@
+> [!WARNING]
+> This branch contains experimental changes that are still under testing. Please use the [`main`](https://github.com/ShuaiZhou302/ActiveScale/tree/main) branch for the stable release.
+
 <h1 align="center">ActiveScale: Scaling Active Perception for Robots<br>across Model, Data, and Hardware</h1>
 
 <p align="center">
