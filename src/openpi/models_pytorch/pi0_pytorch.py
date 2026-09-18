@@ -11,6 +11,7 @@ from torch import nn
 import torch.nn.functional as F  # noqa: N812
 
 import openpi.models.gemma as _gemma
+from openpi.models_pytorch.blockwise_attention import build_packed_block_attention_plan
 from openpi.models_pytorch.camera_head import CameraHead
 from openpi.models_pytorch.camera_head import apply_action_mask_for_denoise_update
 from openpi.models_pytorch.camera_head import Pi0LossOutput
@@ -959,8 +960,17 @@ class PI0Pytorch(nn.Module):
         if self.paligemma_with_expert.paligemma.language_model.layers[0].self_attn.q_proj.weight.dtype == torch.bfloat16:
             prefix_embs = prefix_embs.to(dtype=torch.bfloat16)
         position_ids = (torch.cumsum(prefix_pad_masks, dim=1) - 1).clamp_min(0)
-        att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
-        att_2d_masks_4d = self._prepare_attention_masks_4d(att_2d_masks).to(dtype=prefix_embs.dtype)
+        prefix_plan = None
+        if os.environ.get("PI05_USE_PREFIX_BLOCKWISE_VARLEN_FLASH", "0") == "1":
+            att_2d_masks_4d = None
+            prefix_plan = build_packed_block_attention_plan(
+                prefix_pad_masks,
+                prefix_att_masks,
+                device=prefix_embs.device,
+            )
+        else:
+            att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
+            att_2d_masks_4d = self._prepare_attention_masks_4d(att_2d_masks).to(dtype=prefix_embs.dtype)
         (prefix_out, suffix_out), _ = self.paligemma_with_expert.forward(
             attention_mask=att_2d_masks_4d,
             position_ids=position_ids,
@@ -968,6 +978,9 @@ class PI0Pytorch(nn.Module):
             inputs_embeds=[prefix_embs, None],
             use_cache=False,
             adarms_cond=[None, None],
+            attention_pad_mask=prefix_pad_masks,
+            attention_boundary_mask=prefix_att_masks,
+            attention_plan=prefix_plan,
         )
         if suffix_out is not None:
             raise RuntimeError("prefix-only forward must not execute the Action Expert suffix path")
@@ -1280,11 +1293,28 @@ class PI0Pytorch(nn.Module):
 
         position_ids = (torch.cumsum(pad_masks, dim=1) - 1).clamp_min(0)
 
-        att_2d_masks = make_att_2d_masks(pad_masks, att_masks)
-        att_2d_masks_4d = self._prepare_attention_masks_4d(att_2d_masks)
+        blockwise_plan = None
+        if os.environ.get("PI05_USE_BLOCKWISE_VARLEN_FLASH", "0") == "1":
+            att_2d_masks_4d = None
+            blockwise_plan = build_packed_block_attention_plan(
+                pad_masks,
+                att_masks,
+                device=prefix_embs.device,
+            )
+        else:
+            att_2d_masks = make_att_2d_masks(pad_masks, att_masks)
+            att_2d_masks_4d = self._prepare_attention_masks_4d(att_2d_masks)
 
         # Apply gradient checkpointing if enabled
-        def forward_func(prefix_embs, suffix_embs, att_2d_masks_4d, position_ids, adarms_cond):
+        def forward_func(
+            prefix_embs,
+            suffix_embs,
+            att_2d_masks_4d,
+            position_ids,
+            adarms_cond,
+            pad_masks,
+            att_masks,
+        ):
             (prefix_out, suffix_out), _ = self.paligemma_with_expert.forward(
                 attention_mask=att_2d_masks_4d,
                 position_ids=position_ids,
@@ -1292,6 +1322,9 @@ class PI0Pytorch(nn.Module):
                 inputs_embeds=[prefix_embs, suffix_embs],
                 use_cache=False,
                 adarms_cond=[None, adarms_cond],
+                attention_pad_mask=pad_masks,
+                attention_boundary_mask=att_masks,
+                attention_plan=blockwise_plan,
             )
             return prefix_out, suffix_out
 
@@ -1301,6 +1334,8 @@ class PI0Pytorch(nn.Module):
             att_2d_masks_4d,
             position_ids,
             adarms_cond,
+            pad_masks,
+            att_masks,
         )
         if os.environ.get("PI05_DISABLE_OUTER_FLOW_CHECKPOINT", "0") == "1":
             # Gemma still checkpoints every transformer layer. This switch

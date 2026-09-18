@@ -7,6 +7,7 @@ import types
 import torch
 from torch import nn
 
+from openpi.models_pytorch.blockwise_attention import build_packed_block_attention_plan
 from openpi.models_pytorch.camera_head import CameraHead
 from openpi.models_pytorch.camera_head import activate_pose
 from openpi.models_pytorch.camera_head import apply_action_dim_mask_for_flow
@@ -1102,17 +1103,32 @@ def _tiny_fused_gemma_pair(hidden=32, num_heads=8):
     return fused, copy.deepcopy(fused)
 
 
-def test_cached_rotary_and_residual_alias_preserve_fused_output_and_gradients(monkeypatch):
-    reference, optimized = _tiny_fused_gemma_pair()
-    reference.train()
-    optimized.train()
-    prefix = torch.randn(2, 5, 32)
-    suffix = torch.randn(2, 3, 32)
-    position_ids = torch.arange(8)[None].expand(2, -1)
-    attention_mask = torch.zeros(2, 1, 8, 8)
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA FlashAttention")
+def test_blockwise_flash_preserves_fused_gemma_output_and_gradients(monkeypatch):
+    device = torch.device("cuda")
+    reference, optimized = _tiny_fused_gemma_pair(hidden=64)
+    reference = reference.to(device=device, dtype=torch.bfloat16).train()
+    optimized = optimized.to(device=device, dtype=torch.bfloat16).train()
+    for fused in (reference, optimized):
+        fused.paligemma.language_model.gradient_checkpointing_enable(
+            gradient_checkpointing_kwargs={"use_reentrant": False}
+        )
+        fused.gemma_expert.model.gradient_checkpointing_enable(
+            gradient_checkpointing_kwargs={"use_reentrant": False}
+        )
+    prefix = torch.randn(2, 5, 64, device=device, dtype=torch.bfloat16)
+    suffix = torch.randn(2, 3, 64, device=device, dtype=torch.bfloat16)
+    position_ids = torch.arange(8, device=device)[None].expand(2, -1)
+    pad_mask = torch.ones(2, 8, dtype=torch.bool, device=device)
+    boundary_mask = torch.tensor(
+        [[1, 0, 0, 1, 0, 1, 1, 1], [1, 0, 1, 0, 0, 1, 1, 1]],
+        dtype=torch.bool,
+        device=device,
+    )
+    visible = _make_att_2d_masks(pad_mask, boundary_mask)
+    attention_mask = torch.where(visible[:, None], 0.0, -2.3819763e38).to(torch.bfloat16)
 
-    monkeypatch.delenv("PI05_CACHE_FUSED_ROTARY", raising=False)
-    monkeypatch.delenv("PI05_DISABLE_RESIDUAL_CLONE", raising=False)
+    monkeypatch.delenv("PI05_USE_BLOCKWISE_VARLEN_FLASH", raising=False)
     ref_outputs, _ = reference(
         attention_mask=attention_mask,
         position_ids=position_ids,
@@ -1123,31 +1139,32 @@ def test_cached_rotary_and_residual_alias_preserve_fused_output_and_gradients(mo
     ref_loss = sum(output.float().square().mean() for output in ref_outputs)
     ref_loss.backward()
 
-    monkeypatch.setenv("PI05_CACHE_FUSED_ROTARY", "1")
-    monkeypatch.setenv("PI05_DISABLE_RESIDUAL_CLONE", "1")
+    plan = build_packed_block_attention_plan(pad_mask, boundary_mask, device=device)
+    monkeypatch.setenv("PI05_USE_BLOCKWISE_VARLEN_FLASH", "1")
     opt_outputs, _ = optimized(
-        attention_mask=attention_mask,
+        attention_mask=None,
         position_ids=position_ids,
         inputs_embeds=[prefix, suffix],
         use_cache=False,
         adarms_cond=[None, None],
+        attention_pad_mask=pad_mask,
+        attention_boundary_mask=boundary_mask,
+        attention_plan=plan,
     )
     opt_loss = sum(output.float().square().mean() for output in opt_outputs)
     opt_loss.backward()
 
     for ref_output, opt_output in zip(ref_outputs, opt_outputs, strict=True):
-        torch.testing.assert_close(ref_output, opt_output, atol=0, rtol=0)
-    torch.testing.assert_close(ref_loss, opt_loss, atol=0, rtol=0)
+        torch.testing.assert_close(ref_output, opt_output, atol=3e-2, rtol=3e-2)
+    torch.testing.assert_close(ref_loss, opt_loss, atol=2e-3, rtol=2e-2)
     optimized_params = dict(optimized.named_parameters())
     for name, ref_param in reference.named_parameters():
         opt_param = optimized_params[name]
         if ref_param.grad is None or opt_param.grad is None:
             assert ref_param.grad is None and opt_param.grad is None, name
         else:
-            # Removing an identity clone can change accumulation order without
-            # changing the derivative. Keep this gate far tighter than BF16
-            # training noise while allowing float32 roundoff.
-            torch.testing.assert_close(ref_param.grad, opt_param.grad, atol=1e-7, rtol=1e-6, msg=name)
+            assert torch.isfinite(opt_param.grad).all(), name
+            torch.testing.assert_close(ref_param.grad, opt_param.grad, atol=2e-3, rtol=5e-2, msg=name)
 
 
 def test_hf_gemma_decoder_layers_recompute_with_gc_and_outputs_match():

@@ -54,6 +54,20 @@ else
   : "${ACTIVESCALE_BASE_CHECKPOINT:?Set ACTIVESCALE_BASE_CHECKPOINT}"
 fi
 
+case "${ACTIVESCALE_ATTENTION_BACKEND:-reference}" in
+  reference)
+    export PI05_USE_BLOCKWISE_VARLEN_FLASH=0
+    export PI05_USE_PREFIX_BLOCKWISE_VARLEN_FLASH=0
+    ;;
+  packed_flash)
+    export PI05_USE_BLOCKWISE_VARLEN_FLASH=1
+    export PI05_USE_PREFIX_BLOCKWISE_VARLEN_FLASH=1
+    ;;
+  *)
+    echo "ACTIVESCALE_ATTENTION_BACKEND must be reference or packed_flash" >&2
+    exit 2
+    ;;
+esac
 export PI05_DISABLE_OUTER_FLOW_CHECKPOINT=${PI05_DISABLE_OUTER_FLOW_CHECKPOINT:-0}
 # PyTorch's foreach norm kernel can stall on rank-dependent mixed-objective
 # gradient sets. The scalar reduction computes the same global norm reliably.

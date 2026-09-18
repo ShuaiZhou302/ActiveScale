@@ -1,3 +1,4 @@
+import os
 from typing import Literal
 
 import torch
@@ -6,6 +7,10 @@ from transformers import GemmaForCausalLM
 from transformers import PaliGemmaForConditionalGeneration
 from transformers.models.auto import CONFIG_MAPPING
 from transformers.models.gemma import modeling_gemma
+
+from openpi.models_pytorch.blockwise_attention import blockwise_varlen_flash_attention
+from openpi.models_pytorch.blockwise_attention import build_packed_block_attention_plan
+from openpi.models_pytorch.blockwise_attention import PackedBlockAttentionPlan
 
 
 class PaliGemmaWithExpertModel(nn.Module):
@@ -87,6 +92,77 @@ class PaliGemmaWithExpertModel(nn.Module):
     def embed_language_tokens(self, tokens: torch.Tensor):
         return self.paligemma.language_model.embed_tokens(tokens)
 
+    def _forward_prefix_blockwise(
+        self,
+        hidden_states: torch.Tensor,
+        position_ids: torch.Tensor,
+        plan: PackedBlockAttentionPlan,
+        adarms_cond: torch.Tensor | None,
+    ) -> torch.Tensor:
+        """Run the prefix-only Gemma stack with the exact packed mask."""
+        model = self.paligemma.language_model
+        position_embeddings = model.rotary_emb(hidden_states, position_ids)
+        use_gradient_checkpointing = bool(model.gradient_checkpointing and self.training)
+
+        def compute_layer(layer_idx, layer_hidden_states):
+            layer = model.layers[layer_idx]
+            residual = layer_hidden_states
+            normed_hidden_states, gate = layer.input_layernorm(layer_hidden_states, cond=adarms_cond)
+
+            input_shape = normed_hidden_states.shape[:-1]
+            hidden_shape = (*input_shape, -1, layer.self_attn.head_dim)
+            query_states = layer.self_attn.q_proj(normed_hidden_states).view(hidden_shape).transpose(1, 2)
+            key_states = layer.self_attn.k_proj(normed_hidden_states).view(hidden_shape).transpose(1, 2)
+            value_states = layer.self_attn.v_proj(normed_hidden_states).view(hidden_shape).transpose(1, 2)
+            query_states, key_states = modeling_gemma.apply_rotary_pos_emb(
+                query_states,
+                key_states,
+                *position_embeddings,
+                unsqueeze_dim=1,
+            )
+            attention_output = blockwise_varlen_flash_attention(
+                query_states,
+                key_states,
+                value_states,
+                plan,
+                scale=layer.self_attn.scaling,
+            ).transpose(1, 2).contiguous()
+            attention_output = attention_output.reshape(*input_shape, -1)
+            attention_output = layer.self_attn.o_proj(attention_output)
+            layer_hidden_states = modeling_gemma._gated_residual(residual, attention_output, gate)  # noqa: SLF001
+
+            residual = layer_hidden_states
+            normed_hidden_states, gate = layer.post_attention_layernorm(
+                layer_hidden_states,
+                cond=adarms_cond,
+            )
+            mlp_output = layer.mlp(normed_hidden_states)
+            return modeling_gemma._gated_residual(residual, mlp_output, gate)  # noqa: SLF001
+
+        for layer_idx in range(self.paligemma.config.text_config.num_hidden_layers):
+            if use_gradient_checkpointing:
+                hidden_states = torch.utils.checkpoint.checkpoint(
+                    compute_layer,
+                    layer_idx,
+                    hidden_states,
+                    use_reentrant=False,
+                    preserve_rng_state=False,
+                )
+            else:
+                hidden_states = compute_layer(layer_idx, hidden_states)
+
+        if use_gradient_checkpointing:
+            hidden_states, _ = torch.utils.checkpoint.checkpoint(
+                model.norm,
+                hidden_states,
+                adarms_cond,
+                use_reentrant=False,
+                preserve_rng_state=False,
+            )
+        else:
+            hidden_states, _ = model.norm(hidden_states, adarms_cond)
+        return hidden_states
+
     def forward(
         self,
         attention_mask: torch.Tensor | None = None,
@@ -95,20 +171,37 @@ class PaliGemmaWithExpertModel(nn.Module):
         inputs_embeds: list[torch.FloatTensor] | None = None,
         use_cache: bool | None = None,
         adarms_cond: list[torch.Tensor] | None = None,
+        attention_pad_mask: torch.Tensor | None = None,
+        attention_boundary_mask: torch.Tensor | None = None,
+        attention_plan: PackedBlockAttentionPlan | None = None,
     ):
         if adarms_cond is None:
             adarms_cond = [None, None]
         if inputs_embeds[1] is None:
-            prefix_output = self.paligemma.language_model.forward(
-                inputs_embeds=inputs_embeds[0],
-                attention_mask=attention_mask,
-                position_ids=position_ids,
-                past_key_values=past_key_values,
-                use_cache=use_cache,
-                adarms_cond=adarms_cond[0] if adarms_cond is not None else None,
+            use_prefix_blockwise = (
+                os.environ.get("PI05_USE_PREFIX_BLOCKWISE_VARLEN_FLASH", "0") == "1"
+                and attention_plan is not None
+                and not use_cache
             )
-            prefix_past_key_values = prefix_output.past_key_values
-            prefix_output = prefix_output.last_hidden_state
+            if use_prefix_blockwise:
+                prefix_output = self._forward_prefix_blockwise(
+                    inputs_embeds[0],
+                    position_ids,
+                    attention_plan,
+                    adarms_cond[0],
+                )
+                prefix_past_key_values = None
+            else:
+                prefix_output = self.paligemma.language_model.forward(
+                    inputs_embeds=inputs_embeds[0],
+                    attention_mask=attention_mask,
+                    position_ids=position_ids,
+                    past_key_values=past_key_values,
+                    use_cache=use_cache,
+                    adarms_cond=adarms_cond[0] if adarms_cond is not None else None,
+                )
+                prefix_past_key_values = prefix_output.past_key_values
+                prefix_output = prefix_output.last_hidden_state
             suffix_output = None
         elif inputs_embeds[0] is None:
             suffix_output = self.gemma_expert.model.forward(
@@ -125,7 +218,16 @@ class PaliGemmaWithExpertModel(nn.Module):
         else:
             models = [self.paligemma.language_model, self.gemma_expert.model]
             num_layers = self.paligemma.config.text_config.num_hidden_layers
-
+            blockwise_plan = attention_plan
+            use_blockwise_flash = os.environ.get("PI05_USE_BLOCKWISE_VARLEN_FLASH", "0") == "1"
+            if use_blockwise_flash and blockwise_plan is None:
+                if attention_pad_mask is None or attention_boundary_mask is None:
+                    raise ValueError("blockwise varlen FlashAttention requires compact pad and boundary masks")
+                blockwise_plan = build_packed_block_attention_plan(
+                    attention_pad_mask,
+                    attention_boundary_mask,
+                    device=inputs_embeds[0].device,
+                )
             # Check if gradient checkpointing is enabled for any of the models
             use_gradient_checkpointing = (
                 hasattr(self.gemma_expert.model, "gradient_checkpointing")
@@ -197,14 +299,23 @@ class PaliGemmaWithExpertModel(nn.Module):
                 scaling = self.paligemma.language_model.layers[layer_idx].self_attn.scaling
 
                 # Attention computation
-                att_output, _ = modeling_gemma.eager_attention_forward(
-                    self.paligemma.language_model.layers[layer_idx].self_attn,
-                    query_states,
-                    key_states,
-                    value_states,
-                    attention_mask,
-                    scaling,
-                )
+                if blockwise_plan is not None:
+                    att_output = blockwise_varlen_flash_attention(
+                        query_states,
+                        key_states,
+                        value_states,
+                        blockwise_plan,
+                        scale=scaling,
+                    ).transpose(1, 2).contiguous()
+                else:
+                    att_output, _ = modeling_gemma.eager_attention_forward(
+                        self.paligemma.language_model.layers[layer_idx].self_attn,
+                        query_states,
+                        key_states,
+                        value_states,
+                        attention_mask,
+                        scaling,
+                    )
                 # Get head_dim from the current layer, not from the model
                 head_dim = self.paligemma.language_model.layers[layer_idx].self_attn.head_dim
                 att_output = att_output.reshape(batch_size, -1, 1 * 8 * head_dim)

@@ -62,6 +62,14 @@ of 5e-5 to 5e-6 after a 1,000-step warmup.
 The public release uses the original Hugging Face eager attention path for
 both prefix-only and fused prefix/action-expert training.
 
+The experimental `beta` branch also provides an exact packed block-causal
+backend. Enable it only after its local smoke test passes:
+
+```bash
+ACTIVESCALE_ATTENTION_BACKEND=packed_flash \
+  bash scripts/train_activescale.sh midtrain <steps> [save_interval]
+```
+
 The release runner also sets `PI05_GRAD_CLIP_FOREACH=0` and
 `PI05_ADAMW_FOREACH=0`. These retain the same global-norm clipping and AdamW
 rules while avoiding PyTorch multi-tensor foreach kernel stalls observed with

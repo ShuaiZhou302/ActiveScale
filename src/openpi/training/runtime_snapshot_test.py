@@ -109,6 +109,8 @@ def test_contract_hash_changes_with_cache_manifest(tmp_path, monkeypatch):
 
 def test_contract_hash_changes_with_execution_settings(tmp_path, monkeypatch):
     first = runtime_snapshot.build_runtime_snapshot(_Config(), repo_root=tmp_path, world_size=8)
+    monkeypatch.setenv("PI05_USE_BLOCKWISE_VARLEN_FLASH", "1")
+    monkeypatch.setenv("PI05_USE_PREFIX_BLOCKWISE_VARLEN_FLASH", "1")
     monkeypatch.setenv("PI05_DISABLE_OUTER_FLOW_CHECKPOINT", "1")
     monkeypatch.setenv("PI05_DISABLE_OUTER_IMAGE_CHECKPOINT", "1")
     monkeypatch.setenv("PI05_TRIM_TRAILING_TOKEN_PADDING", "1")
@@ -117,6 +119,8 @@ def test_contract_hash_changes_with_execution_settings(tmp_path, monkeypatch):
 
     assert first["contract_sha256"] != second["contract_sha256"]
     assert second["attention_execution"] == {
+        "blockwise_varlen_flash": "1",
+        "prefix_blockwise_varlen_flash": "1",
         "outer_flow_checkpoint_disabled": "1",
         "outer_image_checkpoint_disabled": "1",
         "trailing_token_padding_trimmed": "1",

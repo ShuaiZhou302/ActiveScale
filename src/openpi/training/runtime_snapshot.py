@@ -202,6 +202,8 @@ def build_runtime_snapshot(config: Any, *, repo_root: Path, world_size: int) -> 
             "gradient_checkpointing_disabled": os.environ.get("PI05_DISABLE_GRADIENT_CHECKPOINTING", "0"),
         },
         "attention_execution": {
+            "blockwise_varlen_flash": os.environ.get("PI05_USE_BLOCKWISE_VARLEN_FLASH", "0"),
+            "prefix_blockwise_varlen_flash": os.environ.get("PI05_USE_PREFIX_BLOCKWISE_VARLEN_FLASH", "0"),
             "outer_flow_checkpoint_disabled": os.environ.get("PI05_DISABLE_OUTER_FLOW_CHECKPOINT", "0"),
             "outer_image_checkpoint_disabled": os.environ.get("PI05_DISABLE_OUTER_IMAGE_CHECKPOINT", "0"),
             "trailing_token_padding_trimmed": os.environ.get("PI05_TRIM_TRAILING_TOKEN_PADDING", "0"),
